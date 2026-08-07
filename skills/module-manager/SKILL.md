@@ -11,7 +11,7 @@ description: >
 
 This skill teaches you how to use the `module_manager` tool to manage pi modules.
 
-Pi modules are extensions, skills, and prompts stored in a shared vault (`~/.pi/modules/`).
+Pi modules are extensions, skills, and prompts stored in a shared vault (`~/.pi-modules-vault/`).
 Modules are explicitly declared in `settings.json` and loaded at startup.
 
 ## Module Types
@@ -27,7 +27,7 @@ Note: Themes are NOT managed by the module system. They live in `~/.pi/agent/the
 
 ## Module Vault
 
-- **Global vault:** `~/.pi/modules/`
+- **Global vault:** `~/.pi-modules-vault/`
 - **Project vault:** `<project>/.pi/modules/` (overrides global)
 
 Each module is a directory containing:
@@ -85,8 +85,8 @@ module_manager activate --name my-module --project ~/my-project
 ```
 
 This creates:
-- `~/my-project/.pi/extensions/my-module` → `~/.pi/modules/my-module`
-- `~/my-project/.pi/skills/my-module` → `~/.pi/modules/my-module`
+- `~/my-project/.pi/extensions/my-module` → `~/.pi-modules-vault/my-module`
+- `~/my-project/.pi/skills/my-module` → `~/.pi-modules-vault/my-module`
 
 Pi auto-discovers the symlinks. No settings.json changes needed!
 
@@ -99,7 +99,7 @@ module_manager deactivate --name my-module --project ~/my-project
 
 The module system uses **symlinks** to work with pi's auto-discovery:
 
-1. **Shared vault** at `~/.pi/modules/` (single source of truth)
+1. **Shared vault** at `~/.pi-modules-vault/` (single source of truth)
 2. **Activate per-project** by creating symlinks
 3. **Pi auto-discovers** the symlinked modules
 4. **Deactivate** by removing symlinks
