@@ -6,6 +6,7 @@ import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import {
   getVaultDir,
   resolveVaultDirs,
+  projectVaultDir,
   findModule,
   listModules,
   readActiveModules,
@@ -28,6 +29,7 @@ import {
   hasSkill,
   hasExtension,
 } from './vault.js';
+import { resolveSourceToDir } from './source.js';
 import type { ModuleManifest } from './types.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -220,7 +222,8 @@ export default function moduleManager(pi: ExtensionAPI) {
       const name = params.name as string | undefined;
       const from = params.from as string | undefined;
       const version = params.version as string | undefined;
-      const scope = (params.scope as string || 'user') as 'user' | 'project';
+      const explicitScope = (params.scope as string | undefined) || undefined;
+      const scope = (explicitScope || 'user') as 'user' | 'project';
       const projectDir = (params.project as string) || (ctx?.cwd as string) || undefined;
 
       switch (action) {
@@ -233,10 +236,17 @@ export default function moduleManager(pi: ExtensionAPI) {
             return { content: [{ type: 'text', text: 'Error: "from" is required for install.' }], details: {} };
           }
 
-          // Resolve source to a local directory
-          const sourceDir = resolveSourceToDir(from, projectDir);
+          // Resolve source to a local directory (local path, or git URL
+          // cloned into the vault cache — optionally pinned to `version`)
+          const sourceDir = resolveSourceToDir(from, projectDir, version);
           if (!sourceDir) {
-            return { content: [{ type: 'text', text: `Error: Could not resolve source "${from}". Check the path or URL.` }], details: {} };
+            return {
+              content: [{
+                type: 'text',
+                text: `Error: Could not resolve source "${from}". For a path: check it exists. For a git URL: check the URL/branch/tag and that git can clone it.`,
+              }],
+              details: {},
+            };
           }
 
           // Create manifest
@@ -362,11 +372,23 @@ export default function moduleManager(pi: ExtensionAPI) {
             return { content: [{ type: 'text', text: `Module "${name}" not found in vault.` }], details: {} };
           }
 
-          // Re-fetch from source
-          const sourceDir = resolveSourceToDir(existing.manifest.source, projectDir);
+          // Re-fetch from source (git URLs are cloned/pulled in the vault
+          // cache; local paths must still exist on disk)
+          const sourceDir = resolveSourceToDir(existing.manifest.source, projectDir, version);
           if (!sourceDir) {
-            return { content: [{ type: 'text', text: `Error: Could not resolve source "${existing.manifest.source}".` }], details: {} };
+            return {
+              content: [{
+                type: 'text',
+                text: `Error: Could not resolve source "${existing.manifest.source}" for module "${name}". The stored source is stale (e.g. a local path that no longer exists) — reinstall with a resolvable source: module_manager install --name ${name} --from <path-or-git-url>`,
+              }],
+              details: {},
+            };
           }
+
+          // Remember which vault the module lives in so `update` re-installs it
+          // to the same place (never silently moves it between vaults).
+          const projectVault = projectVaultDir(projectDir);
+          const installedInProject = projectVault !== null && existing.path.startsWith(projectVault + path.sep);
 
           // Remove old version
           uninstallModule(name, projectDir);
@@ -379,7 +401,10 @@ export default function moduleManager(pi: ExtensionAPI) {
             updatedAt: new Date().toISOString(),
           };
 
-          const installDir = scope === 'project' ? projectDir : undefined;
+          // Explicit scope wins; otherwise keep the module where it was found
+          const installDir = explicitScope
+            ? (explicitScope === 'project' ? projectDir : undefined)
+            : (installedInProject ? projectDir : undefined);
           const result = installModule(sourceDir, name, manifest, installDir);
 
           return {
@@ -549,23 +574,4 @@ export default function moduleManager(pi: ExtensionAPI) {
   });
 }
 
-// ── Source Resolution ────────────────────────────────────────────────────────
-
-function resolveSourceToDir(from: string, projectDir?: string): string | null {
-  // Path source — direct local path
-  if (fs.existsSync(from)) {
-    const stat = fs.statSync(from);
-    if (stat.isDirectory()) return from;
-    // If it's a file, check if parent directory is a module
-    return path.dirname(from);
-  }
-
-  // Git source — could clone to temp and return
-  // TODO: implement git clone for "github:user/repo" format
-  if (from.startsWith('github:') || from.startsWith('git+')) {
-    // For now, return null — git support to be added
-    return null;
-  }
-
-  return null;
-}
+// (Source resolution lives in ./source.ts — local paths and git URLs.)

@@ -308,7 +308,7 @@ export function runNpmInstall(moduleDir: string): { success: boolean; error?: st
   }
 
   try {
-    execSync('npm install --production', {
+    execSync('npm install --production --legacy-peer-deps', {
       cwd: moduleDir,
       stdio: 'pipe',
       timeout: 120_000,
