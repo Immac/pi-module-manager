@@ -4,6 +4,8 @@ import path from 'node:path';
 import os from 'node:os';
 import {
   getVaultDir,
+  getAgentDir,
+  divergentCopies,
   hasExtension,
   hasSkill,
   hasPrompts,
@@ -433,5 +435,156 @@ describe('listActiveModules', () => {
     expect(names).not.toContain('module-c');
     
     cleanupDir(projectDir);
+  });
+});
+
+// ── Module-manager improvements: agent dir, dedupe guards, divergence ────────
+
+describe('getAgentDir', () => {
+  it('honors PI_CODING_AGENT_DIR, defaults to ~/pi-base', () => {
+    const prev = process.env.PI_CODING_AGENT_DIR;
+    try {
+      process.env.PI_CODING_AGENT_DIR = '/tmp/agent-x';
+      expect(getAgentDir()).toBe('/tmp/agent-x');
+      delete process.env.PI_CODING_AGENT_DIR;
+      expect(getAgentDir()).toBe(path.join(os.homedir(), 'pi-base'));
+    } finally {
+      if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = prev;
+    }
+  });
+});
+
+describe('activate dedupe guards', () => {
+  let prev: string | undefined;
+  let agentDir: string;
+
+  beforeEach(() => {
+    prev = process.env.PI_CODING_AGENT_DIR;
+    agentDir = tmpDir();
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+  });
+  afterEach(() => {
+    if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prev;
+    cleanupDir(agentDir);
+  });
+
+  it('refuses project activation when the module is active globally', () => {
+    const modulePath = path.join(getVaultDir(), 'test-global-guard');
+    fs.mkdirSync(modulePath, { recursive: true });
+    fs.writeFileSync(path.join(modulePath, 'SKILL.md'), '---\nname: test-global-guard\ndescription: t\n---\n# x');
+    fs.mkdirSync(path.join(agentDir, 'skills'), { recursive: true });
+    fs.symlinkSync(modulePath, path.join(agentDir, 'skills', 'test-global-guard'));
+    const projectDir = tmpDir();
+    try {
+      const res = activateModule('test-global-guard', projectDir);
+      expect(res.success).toBe(false);
+      expect(res.message).toMatch(/GLOBALLY/);
+      expect(res.trustResult).toBeUndefined(); // refused before any trust write
+      expect(fs.existsSync(path.join(projectDir, '.pi', 'skills', 'test-global-guard'))).toBe(false);
+    } finally {
+      fs.rmSync(modulePath, { recursive: true, force: true });
+      cleanupDir(projectDir);
+    }
+  });
+
+  it('refuses activation when a divergent out-of-vault copy exists', () => {
+    const modulePath = path.join(getVaultDir(), 'test-divergent-guard');
+    fs.mkdirSync(modulePath, { recursive: true });
+    fs.writeFileSync(path.join(modulePath, 'SKILL.md'), '---\nname: test-divergent-guard\ndescription: t\n---\n# x');
+    const projectDir = tmpDir();
+    const skillDir = path.join(projectDir, '.pi', 'skills');
+    fs.mkdirSync(skillDir, { recursive: true });
+    fs.mkdirSync(path.join(skillDir, 'test-divergent-guard')); // unmanaged REAL copy
+    try {
+      const res = activateModule('test-divergent-guard', projectDir);
+      expect(res.success).toBe(false);
+      expect(res.message).toMatch(/divergent/i);
+      expect(res.message).toContain('test-divergent-guard');
+    } finally {
+      fs.rmSync(modulePath, { recursive: true, force: true });
+      cleanupDir(projectDir);
+    }
+  });
+
+  it('activates normally when nothing conflicts', () => {
+    const modulePath = path.join(getVaultDir(), 'test-activate-clean');
+    fs.mkdirSync(modulePath, { recursive: true });
+    fs.writeFileSync(path.join(modulePath, 'SKILL.md'), '---\nname: test-activate-clean\ndescription: t\n---\n# x');
+    const projectDir = tmpDir();
+    try {
+      const res = activateModule('test-activate-clean', projectDir);
+      expect(res.success).toBe(true);
+      expect(fs.lstatSync(path.join(projectDir, '.pi', 'skills', 'test-activate-clean')).isSymbolicLink()).toBe(true);
+    } finally {
+      fs.rmSync(modulePath, { recursive: true, force: true });
+      cleanupDir(projectDir);
+    }
+  });
+});
+
+describe('listActiveModules grouping (spec §4.2: project wins with a note)', () => {
+  it('same name in both scopes → project-local + alsoGlobal', () => {
+    const prev = process.env.PI_CODING_AGENT_DIR;
+    const agentDir = tmpDir();
+    const projectDir = tmpDir();
+    try {
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      fs.mkdirSync(path.join(agentDir, 'skills'), { recursive: true });
+      fs.symlinkSync('/tmp/both', path.join(agentDir, 'skills', 'both-mod'));
+      fs.symlinkSync('/tmp/glob', path.join(agentDir, 'skills', 'glob-only'));
+      fs.mkdirSync(path.join(projectDir, '.pi', 'skills'), { recursive: true });
+      fs.symlinkSync('/tmp/both', path.join(projectDir, '.pi', 'skills', 'both-mod'));
+      fs.symlinkSync('/tmp/proj', path.join(projectDir, '.pi', 'skills', 'proj-only'));
+
+      const active = listActiveModules(projectDir);
+      const both = active.find(m => m.name === 'both-mod');
+      expect(both?.scope).toBe('project');
+      expect(both?.alsoGlobal).toBe(true);
+      expect(active.find(m => m.name === 'glob-only')?.scope).toBe('global');
+      const proj = active.find(m => m.name === 'proj-only');
+      expect(proj?.scope).toBe('project');
+      expect(proj?.alsoGlobal).toBeUndefined();
+      // listed exactly once even though present in both scopes
+      expect(active.filter(m => m.name === 'both-mod').length).toBe(1);
+    } finally {
+      if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = prev;
+      cleanupDir(agentDir);
+      cleanupDir(projectDir);
+    }
+  });
+});
+
+describe('divergentCopies', () => {
+  it('flags real copies outside the vault; vault-pointing symlinks are fine', () => {
+    const prev = process.env.PI_CODING_AGENT_DIR;
+    const agentDir = tmpDir();
+    try {
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      const modulePath = path.join(getVaultDir(), 'test-divergent-find');
+      fs.mkdirSync(modulePath, { recursive: true });
+      fs.writeFileSync(path.join(modulePath, 'SKILL.md'), '---\nname: test-divergent-find\ndescription: t\n---\n# x');
+
+      // unmanaged real copy in the agent skills dir
+      fs.mkdirSync(path.join(agentDir, 'skills', 'test-divergent-find'), { recursive: true });
+      // correct vault symlink in the project
+      const projectDir = tmpDir();
+      fs.mkdirSync(path.join(projectDir, '.pi', 'skills'), { recursive: true });
+      fs.symlinkSync(modulePath, path.join(projectDir, '.pi', 'skills', 'test-divergent-find'));
+
+      const hits = divergentCopies('test-divergent-find', projectDir);
+      expect(hits.length).toBe(1);
+      expect(hits[0]).toContain(path.join(agentDir, 'skills'));
+      expect(hits[0]).toContain('real copy');
+
+      cleanupDir(projectDir);
+      fs.rmSync(modulePath, { recursive: true, force: true });
+    } finally {
+      if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = prev;
+      cleanupDir(agentDir);
+    }
   });
 });

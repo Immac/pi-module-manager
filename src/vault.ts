@@ -12,6 +12,15 @@ export function getVaultDir(): string {
   return path.join(os.homedir(), '.pi-modules-vault');
 }
 
+/** The pi agent directory (global activation lives here: <agent>/skills and
+ *  <agent>/extensions). PI_CODING_AGENT_DIR is what pi itself runs with —
+ *  follow it instead of hardcoding, with ~/pi-base as the documented default. */
+export function getAgentDir(): string {
+  const env = process.env.PI_CODING_AGENT_DIR;
+  if (env && path.isAbsolute(env)) return env;
+  return path.join(os.homedir(), 'pi-base');
+}
+
 export function projectVaultDir(projectDir?: string): string | null {
   if (!projectDir) return null;
   return path.resolve(projectDir, '.pi', 'modules');
@@ -28,7 +37,7 @@ export function resolveVaultDirs(projectDir?: string): string[] {
 // ── Trust File Operations ────────────────────────────────────────────────────
 
 function trustFilePath(): string {
-  return path.join(os.homedir(), 'pi-base', 'trust.json');
+  return path.join(getAgentDir(), 'trust.json');
 }
 
 export function readTrustFile(): Record<string, boolean | null> {
@@ -192,55 +201,71 @@ export function listModules(vaultDir: string): ResolvedModule[] {
   return modules;
 }
 
-/**
- * Read active modules from settings.json
- */
-export function readActiveModules(projectDir?: string): string[] {
-  const settingsPath = path.join(os.homedir(), '.pi', 'agent', 'settings.json');
-  try {
-    if (fs.existsSync(settingsPath)) {
-      const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
-      return settings.modules || [];
-    }
-  } catch {
-    // ignore
+/** Where a module is activated globally (always loaded), if at all. */
+export function activeGlobalPath(name: string): string | null {
+  const agent = getAgentDir();
+  for (const dir of ['extensions', 'skills']) {
+    const p = path.join(agent, dir, name);
+    if (fs.existsSync(p) || isLink(p)) return p;
   }
-  return [];
+  return null;
 }
 
-/**
- * Resolve module names to active modules with vault paths
- */
-export function resolveActiveModules(projectDir?: string): ResolvedModule[] {
-  const activeNames = readActiveModules(projectDir);
-  const vaultDirs = resolveVaultDirs(projectDir);
-  const resolved: ResolvedModule[] = [];
-  const seen = new Set<string>();
+function isLink(p: string): boolean {
+  try {
+    return fs.lstatSync(p).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
 
-  for (const ref of activeNames) {
-    const { name } = parseModuleRef(ref);
-    if (seen.has(name)) continue;
-    seen.add(name);
+/** Copies of `name` that live OUTSIDE the vault while the vault has the same
+ *  module — the divergence hazard: updates touch only the vault copy, so the
+ *  others silently rot (and pi may load the wrong one first). Checks the
+ *  agent dirs (incl. the legacy ~/.pi/agent location when the agent dir has
+ *  moved on) and the project's .pi dirs. Symlinks resolving to the vault are
+ *  correct activations, not copies. */
+export function divergentCopies(name: string, projectDir?: string): string[] {
+  const vaultPath = path.join(getVaultDir(), name);
+  if (!fs.existsSync(vaultPath)) return [];
+  let vaultReal = vaultPath;
+  try {
+    vaultReal = fs.realpathSync(vaultPath);
+  } catch { /* keep raw */ }
 
-    for (const vaultDir of vaultDirs) {
-      const moduleDir = path.join(vaultDir, name);
-      if (!fs.existsSync(moduleDir)) continue;
-
-      const manifest = readManifest(moduleDir);
-      if (!manifest) continue;
-
-      resolved.push({
-        name: manifest.name,
-        path: moduleDir,
-        manifest,
-        type: detectModuleType(moduleDir),
-        active: true,
-      });
-      break;
-    }
+  const agent = getAgentDir();
+  const roots = [path.join(agent, 'skills'), path.join(agent, 'extensions')];
+  const legacy = path.join(os.homedir(), '.pi', 'agent');
+  if (path.resolve(legacy) !== path.resolve(agent)) {
+    roots.push(path.join(legacy, 'skills'), path.join(legacy, 'extensions'));
+  }
+  if (projectDir) {
+    roots.push(path.join(projectDir, '.pi', 'skills'), path.join(projectDir, '.pi', 'extensions'));
   }
 
-  return resolved;
+  const hits: string[] = [];
+  for (const root of roots) {
+    const p = path.join(root, name);
+    let st: fs.Stats;
+    try {
+      st = fs.lstatSync(p);
+    } catch {
+      continue;
+    }
+    if (st.isSymbolicLink()) {
+      try {
+        if (fs.realpathSync(p) === vaultReal) continue; // correct activation
+      } catch { /* broken link → flagged below */ }
+      try {
+        hits.push(`${p} (symlink → ${fs.readlinkSync(p)})`);
+      } catch {
+        hits.push(`${p} (broken symlink)`);
+      }
+    } else {
+      hits.push(`${p} (real copy — only the vault copy is updated)`);
+    }
+  }
+  return hits;
 }
 
 /**
@@ -431,6 +456,12 @@ export function uninstallModule(name: string, projectDir?: string): InstallResul
 /**
  * Activate a module in a project by creating symlinks.
  * Also auto-trusts the project (writes to trust.json).
+ *
+ * Dedupe rule: a module registers in exactly ONE place. Activation refuses
+ * (a) when the module is already active globally — a project copy would
+ * double-register it and pi reports tool conflicts at session start — and
+ * (b) when divergent out-of-vault copies exist, so they can't silently
+ * shadow the vault copy that updates actually touch.
  */
 export function activateModule(
   moduleName: string,
@@ -440,6 +471,26 @@ export function activateModule(
   const modulePath = path.join(vaultDir, moduleName);
   if (!fs.existsSync(modulePath)) {
     return { success: false, message: `Module "${moduleName}" not found in vault` };
+  }
+
+  const globalPath = activeGlobalPath(moduleName);
+  if (globalPath) {
+    return {
+      success: false,
+      message:
+        `"${moduleName}" is already active GLOBALLY at ${globalPath} (always loaded in every project). ` +
+        `A project symlink would double-register it (tool conflicts at session start). ` +
+        `Remove the global entry first if you want it project-only.`,
+    };
+  }
+  const divergent = divergentCopies(moduleName, projectDir);
+  if (divergent.length > 0) {
+    return {
+      success: false,
+      message:
+        `Refusing to activate "${moduleName}" — divergent copies exist outside the vault:\n  - ${divergent.join('\n  - ')}\n` +
+        `The vault copy is the single source of truth; remove the copies above first.`,
+    };
   }
 
   const moduleType = detectModuleType(modulePath);
@@ -521,43 +572,50 @@ export function deactivateModule(
 /**
  * List active modules in a project (via symlinks), tagged by scope.
  * Returns the union of global and project-local modules.
+ *
+ * When a name is active in BOTH scopes (shouldn't happen — activate refuses
+ * it), the spec says list it once under project-local with a note that it is
+ * also global, so the double-registration is the thing you see.
  */
-export function listActiveModules(projectDir: string): Array<{ name: string; scope: 'global' | 'project' }> {
-  const results: Array<{ name: string; scope: 'global' | 'project' }> = [];
-  const seen = new Set<string>();
-
-  // Global: ~/pi-base/extensions/ and ~/pi-base/skills/
-  const globalExtDir = path.join(os.homedir(), 'pi-base', 'extensions');
-  const globalSkillDir = path.join(os.homedir(), 'pi-base', 'skills');
-
-  for (const dir of [globalExtDir, globalSkillDir]) {
+export function listActiveModules(
+  projectDir: string,
+): Array<{ name: string; scope: 'global' | 'project'; alsoGlobal?: boolean }> {
+  // Global: <agent>/extensions/ and <agent>/skills/ (symlinks and real entries)
+  const globalNames = new Set<string>();
+  const agent = getAgentDir();
+  for (const dir of [path.join(agent, 'extensions'), path.join(agent, 'skills')]) {
     if (!fs.existsSync(dir)) continue;
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
-      if (seen.has(entry.name)) continue;
       // Skip node_modules and the module-manager bootstrap
       if (entry.name === 'node_modules' || entry.name === 'module-manager') continue;
       if (entry.name.endsWith('.ts') || entry.name.endsWith('.js')) continue;
-      seen.add(entry.name);
-      results.push({ name: entry.name, scope: 'global' });
+      globalNames.add(entry.name);
     }
   }
 
   // Project-local: <project>/.pi/extensions/ and <project>/.pi/skills/
   // Only symlinks count as activated modules in a project
-  const projExtDir = path.join(projectDir, '.pi', 'extensions');
-  const projSkillDir = path.join(projectDir, '.pi', 'skills');
-
-  for (const dir of [projExtDir, projSkillDir]) {
+  const projectNames = new Set<string>();
+  for (const dir of [path.join(projectDir, '.pi', 'extensions'), path.join(projectDir, '.pi', 'skills')]) {
     if (!fs.existsSync(dir)) continue;
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       if (!entry.isSymbolicLink()) continue;
-      if (seen.has(entry.name)) continue;
-      seen.add(entry.name);
-      results.push({ name: entry.name, scope: 'project' });
+      projectNames.add(entry.name);
     }
   }
 
+  const results: Array<{ name: string; scope: 'global' | 'project'; alsoGlobal?: boolean }> = [];
+  for (const name of globalNames) {
+    if (!projectNames.has(name)) results.push({ name, scope: 'global' });
+  }
+  for (const name of projectNames) {
+    results.push({
+      name,
+      scope: 'project',
+      ...(globalNames.has(name) ? { alsoGlobal: true } : {}),
+    });
+  }
   return results.sort((a, b) => a.name.localeCompare(b.name));
 }
 

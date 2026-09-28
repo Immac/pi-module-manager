@@ -1,35 +1,25 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
 import { Type } from '@earendil-works/pi-ai';
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import {
   getVaultDir,
-  resolveVaultDirs,
+  getAgentDir,
   projectVaultDir,
   findModule,
   listModules,
-  readActiveModules,
-  resolveActiveModules,
-  parseModuleRef,
-  versionMatches,
   installModule,
   uninstallModule,
   activateModule,
   deactivateModule,
   listActiveModules,
+  divergentCopies,
   runNpmRebuild,
-  readManifest,
-  writeManifest,
-  detectModuleType,
   addTrust,
   removeTrust,
   listTrust,
-  isTrusted,
-  hasSkill,
-  hasExtension,
 } from './vault.js';
-import { resolveSourceToDir } from './source.js';
+import { resolveSourceToDir, isGitSource } from './source.js';
 import type { ModuleManifest } from './types.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -156,38 +146,6 @@ function getSuggestedModules(projectDir: string): SuggestedModule[] {
   });
 }
 
-// ── Settings helpers ─────────────────────────────────────────────────────────
-
-interface SettingsFile {
-  modules?: string[];
-  moduleMode?: 'standalone' | 'extends';
-  [key: string]: unknown;
-}
-
-function userSettingsPath(): string {
-  return path.join(os.homedir(), '.pi', 'agent', 'settings.json');
-}
-
-function projectSettingsPath(projectDir?: string): string | null {
-  if (!projectDir) return null;
-  return path.resolve(projectDir, '.pi', 'settings.json');
-}
-
-function readSettings(filePath: string): SettingsFile {
-  try {
-    if (fs.existsSync(filePath)) {
-      return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-    }
-  } catch { /* corrupted */ }
-  return {};
-}
-
-function writeSettings(filePath: string, data: SettingsFile): void {
-  const dir = path.dirname(filePath);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
-}
-
 // ── Main Extension ───────────────────────────────────────────────────────────
 
 export default function moduleManager(pi: ExtensionAPI) {
@@ -299,7 +257,9 @@ export default function moduleManager(pi: ExtensionAPI) {
 
             text += '\n### Project-local (activated in this project)\n';
             if (projectModules.length > 0) {
-              text += projectModules.map(m => `- ${m.name}`).join('\n') + '\n';
+              text += projectModules
+                .map(m => `- ${m.name}${m.alsoGlobal ? ' (also global — double-registered; remove one copy)' : ''}`)
+                .join('\n') + '\n';
             } else {
               text += '(none)\n';
             }
@@ -310,19 +270,31 @@ export default function moduleManager(pi: ExtensionAPI) {
             };
           }
 
-          // Default: show all modules from the vault
+          // Default: show all modules from the vault, with an active marker
           const vaultDir = getVaultDir();
           const modules = listModules(vaultDir);
-          
+          const active = projectDir ? listActiveModules(projectDir) : [];
+          const activeMap = new Map(active.map(m => [m.name, m]));
+
           let text = '## Module Vault\n\n';
 
           if (modules.length > 0) {
             text += `**${modules.length} modules installed:**\n\n`;
-            text += '| Module | Version | Type |\n';
-            text += '|--------|---------|------|\n';
+            text += '| Module | Version | Type | Active |\n';
+            text += '|--------|---------|------|--------|\n';
             for (const m of modules) {
-              text += `| ${m.name} | v${m.manifest.version} | ${m.type} |\n`;
+              const a = activeMap.get(m.name);
+              const mark = !a
+                ? '—'
+                : a.scope === 'global'
+                  ? 'global'
+                  : a.alsoGlobal
+                    ? 'project + global'
+                    : 'project';
+              text += `| ${m.name} | v${m.manifest.version} | ${m.type} | ${mark} |\n`;
             }
+            text += `\n_Active_ = always loaded globally (\`${getAgentDir()}/skills\` or \`extensions\`)` +
+              ` or symlinked in ${projectDir ?? 'the current project'}. Use \`list --project <path>\` for the grouped view.\n`;
           } else {
             text += 'No modules installed. Use `module_manager install` to add modules.\n';
           }
@@ -344,6 +316,55 @@ export default function moduleManager(pi: ExtensionAPI) {
             return { content: [{ type: 'text', text: `Module "${name}" not found in vault.` }], details: {} };
           }
 
+          const entryExists = (p: string): boolean => {
+            if (fs.existsSync(p)) return true;
+            try {
+              return fs.lstatSync(p).isSymbolicLink(); // broken link still counts as an entry
+            } catch {
+              return false;
+            }
+          };
+
+          // Activation: where (if anywhere) pi loads this module from
+          const agent = getAgentDir();
+          const gPaths = ['skills', 'extensions']
+            .map(d => path.join(agent, d, module.name))
+            .filter(entryExists);
+          const pPaths = projectDir
+            ? ['skills', 'extensions']
+                .map(d => path.join(projectDir, '.pi', d, module.name))
+                .filter(entryExists)
+            : [];
+          const activation = [
+            gPaths.length
+              ? `global — always loaded: ${gPaths.join(', ')}`
+              : 'not active globally',
+            pPaths.length
+              ? `project — ${pPaths.join(', ')}`
+              : projectDir
+                ? 'not active in this project'
+                : 'no project context',
+          ];
+
+          // Health: source resolvable? copies diverging from the vault?
+          const src = module.manifest.source ?? '';
+          const health: string[] = [];
+          if (!src) {
+            health.push('⚠️ no source recorded — update will fail; reinstall with `install --from <path-or-git-url>`');
+          } else if (isGitSource(src)) {
+            health.push(`git source (not probed): ${src}`);
+          } else {
+            const ok = fs.existsSync(src) || fs.existsSync(path.resolve(src));
+            health.push(
+              ok
+                ? `local source OK: ${src}`
+                : `⚠️ local source MISSING: ${src} — update will fail; reinstall with \`install --from <path-or-git-url>\``,
+            );
+          }
+          const divergent = divergentCopies(module.name, projectDir);
+          for (const d of divergent) health.push(`⚠️ divergent copy outside the vault: ${d}`);
+          if (divergent.length === 0) health.push('single copy — the vault is the only location');
+
           const text = [
             `## ${module.name}`,
             `Version: ${module.manifest.version}`,
@@ -353,7 +374,13 @@ export default function moduleManager(pi: ExtensionAPI) {
             `Installed: ${module.manifest.installedAt}`,
             module.manifest.updatedAt ? `Updated: ${module.manifest.updatedAt}` : null,
             module.manifest.native ? '⚠️ Has native dependencies' : null,
-          ].filter(Boolean).join('\n');
+            '',
+            'Activation:',
+            ...activation.map(l => `  - ${l}`),
+            '',
+            'Health:',
+            ...health.map(l => `  - ${l}`),
+          ].filter((l): l is string => l !== null).join('\n');
 
           return {
             content: [{ type: 'text', text }],
