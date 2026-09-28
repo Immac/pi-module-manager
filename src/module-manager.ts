@@ -342,7 +342,9 @@ export default function moduleManager(pi: ExtensionAPI) {
             pPaths.length
               ? `project — ${pPaths.join(', ')}`
               : projectDir
-                ? 'not active in this project'
+                ? gPaths.length
+                  ? 'no project-local copy (global already covers this project)'
+                  : 'not active in this project'
                 : 'no project context',
           ];
 
